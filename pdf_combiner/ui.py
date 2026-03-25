@@ -9,6 +9,7 @@ from pathlib import Path
 from PySide6.QtCore import (
     QEasingCurve,
     QDateTime,
+    QEvent,
     QPoint,
     QPropertyAnimation,
     QSettings,
@@ -19,7 +20,7 @@ from PySide6.QtCore import (
     QUrl,
     Signal,
 )
-from PySide6.QtGui import QAction, QColor, QCursor, QDesktopServices, QDrag, QImage, QPainter, QPixmap
+from PySide6.QtGui import QAction, QCursor, QDesktopServices, QImage, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -139,9 +140,8 @@ class PdfListWidget(QListWidget):
         super().__init__()
         self.setSpacing(14)
         self.setSelectionMode(QListWidget.SingleSelection)
-        self.setDragDropMode(QListWidget.DragDrop)
-        self.setDefaultDropAction(Qt.MoveAction)
-        self.setDragEnabled(True)
+        self.setDragDropMode(QListWidget.NoDragDrop)
+        self.setDragEnabled(False)
         self.setAcceptDrops(True)
         self.setDropIndicatorShown(False)
         self.setAutoScroll(True)
@@ -160,7 +160,9 @@ class PdfListWidget(QListWidget):
         self._dragged_widget: QWidget | None = None
         self._drag_placeholder: QWidget | None = None
         self._drag_original_row: int | None = None
-        self._internal_drop_committed = False
+        self._drag_overlay: QLabel | None = None
+        self._drag_hotspot = QPoint()
+        self._drag_last_global_pos: QPoint | None = None
 
         self._scroll_animation = QPropertyAnimation(self.verticalScrollBar(), b"value", self)
         self._scroll_animation.setDuration(140)
@@ -170,107 +172,90 @@ class PdfListWidget(QListWidget):
         self._autoscroll_timer.setInterval(16)
         self._autoscroll_timer.timeout.connect(self._perform_autoscroll)
 
-    def startDrag(self, supported_actions) -> None:  # noqa: ANN001
-        item = self.currentItem()
-        if item is None:
+    def start_card_drag(self, card: QWidget, hot_spot: QPoint) -> None:
+        if self._dragging_internal:
             return
 
-        widget = self.itemWidget(item)
-        if widget is None:
+        item = self._item_for_widget(card)
+        if item is None or self.count() < 2:
             return
-
-        mime_data = self.model().mimeData(self.selectedIndexes())
-        if mime_data is None:
-            return
-
-        drag = QDrag(self)
-        drag.setMimeData(mime_data)
-        pixmap = self._create_drag_pixmap(widget)
-        drag.setPixmap(pixmap)
-        local_pos = widget.mapFromGlobal(QCursor.pos())
-        drag.setHotSpot(local_pos + QPoint(16, 16))
 
         self._dragging_internal = True
-        self._internal_drop_committed = False
         self._dragged_item = item
-        self._dragged_widget = widget
+        self._dragged_widget = card
         self._drag_original_row = self.row(item)
-        self._drag_placeholder = self._create_drag_placeholder(widget)
+        self._drag_hotspot = QPoint(hot_spot)
+        self._drag_last_global_pos = QCursor.pos()
+        self._drag_placeholder = self._create_drag_placeholder(card)
+
+        overlay = QLabel(self.viewport())
+        overlay.setObjectName("DragGhost")
+        overlay.setPixmap(card.grab())
+        overlay.resize(card.size())
+        overlay.show()
+        overlay.raise_()
+        self._drag_overlay = overlay
 
         self.removeItemWidget(item)
         self.setItemWidget(item, self._drag_placeholder)
         item.setSizeHint(self._drag_placeholder.sizeHint())
-        widget.hide()
+        card.hide()
+        card.setCursor(Qt.ClosedHandCursor)
+        self.setCurrentItem(item)
+        self._update_drag(self._drag_last_global_pos)
 
-        drag.exec(Qt.MoveAction)
+        app = QApplication.instance()
+        if app is not None:
+            app.installEventFilter(self)
 
-        if not self._internal_drop_committed and self._dragged_item is not None and self._drag_original_row is not None:
-            self._move_item_with_widget(self.row(self._dragged_item), self._drag_original_row, self._drag_placeholder)
+    def eventFilter(self, watched, event) -> bool:  # noqa: ANN001
+        if not getattr(self, "_dragging_internal", False):
+            return super().eventFilter(watched, event)
 
-        if self._dragged_item is not None and self._dragged_widget is not None:
-            self.removeItemWidget(self._dragged_item)
-            self.setItemWidget(self._dragged_item, self._dragged_widget)
-            self._dragged_item.setSizeHint(self._dragged_widget.sizeHint())
-            self._dragged_widget.show()
-            self.setCurrentItem(self._dragged_item)
+        event_type = event.type()
+        if event_type == QEvent.MouseMove and hasattr(event, "globalPosition"):
+            self._update_drag(event.globalPosition().toPoint())
+            event.accept()
+            return True
 
-        drop_committed = self._internal_drop_committed
-        self._reset_drag_state()
-        if not drop_committed:
-            self.order_changed.emit()
+        if event_type == QEvent.MouseButtonRelease:
+            self.finish_card_drag(commit=True)
+            event.accept()
+            return True
+
+        if event_type == QEvent.KeyPress and getattr(event, "key", None) is not None and event.key() == Qt.Key_Escape:
+            self.finish_card_drag(commit=False)
+            event.accept()
+            return True
+
+        return super().eventFilter(watched, event)
 
     def dragEnterEvent(self, event) -> None:  # noqa: ANN001
         if extract_pdf_paths_from_mime_data(event.mimeData()):
             self.file_drag_active_changed.emit(True)
             event.acceptProposedAction()
             return
-
-        self._dragging_internal = event.source() is self
-        if self._dragging_internal:
-            event.acceptProposedAction()
-            return
-        super().dragEnterEvent(event)
+        event.ignore()
 
     def dragMoveEvent(self, event) -> None:  # noqa: ANN001
         if extract_pdf_paths_from_mime_data(event.mimeData()):
             self.file_drag_active_changed.emit(True)
             event.acceptProposedAction()
             return
-
-        self._dragging_internal = event.source() is self
-        if self._dragging_internal:
-            pos = self._event_pos(event)
-            self._drag_hover_pos = pos
-            self._update_autoscroll(pos)
-            self._reorder_dragged_item(pos)
-            event.acceptProposedAction()
-            return
-        super().dragMoveEvent(event)
+        event.ignore()
 
     def dragLeaveEvent(self, event) -> None:  # noqa: ANN001
         self.file_drag_active_changed.emit(False)
-        self._stop_autoscroll_feedback()
         super().dragLeaveEvent(event)
 
     def dropEvent(self, event) -> None:  # noqa: ANN001
         paths = extract_pdf_paths_from_mime_data(event.mimeData())
         if paths:
             self.file_drag_active_changed.emit(False)
-            self._reset_drag_state()
             self.files_dropped.emit(paths)
             event.acceptProposedAction()
             return
-
-        if self._dragging_internal:
-            self._internal_drop_committed = True
-            event.acceptProposedAction()
-            self._stop_autoscroll_feedback()
-            self.order_changed.emit()
-            return
-
-        super().dropEvent(event)
-        self._reset_drag_state()
-        self.order_changed.emit()
+        event.ignore()
 
     def wheelEvent(self, event) -> None:  # noqa: ANN001
         if event.modifiers() & Qt.ControlModifier:
@@ -305,19 +290,21 @@ class PdfListWidget(QListWidget):
             return event.position().toPoint()
         return event.pos()
 
-    def _stop_autoscroll_feedback(self) -> None:
-        self._dragging_internal = False
+    def _stop_autoscroll(self) -> None:
         self._drag_hover_pos = None
         self._autoscroll_speed = 0
         self._autoscroll_timer.stop()
 
     def _reset_drag_state(self) -> None:
-        self._stop_autoscroll_feedback()
+        self._stop_autoscroll()
+        self._dragging_internal = False
         self._dragged_item = None
         self._dragged_widget = None
         self._drag_placeholder = None
         self._drag_original_row = None
-        self._internal_drop_committed = False
+        self._drag_overlay = None
+        self._drag_hotspot = QPoint()
+        self._drag_last_global_pos = None
 
     def _update_autoscroll(self, pos: QPoint) -> None:
         margin = 72
@@ -345,9 +332,8 @@ class PdfListWidget(QListWidget):
 
         scroll_bar = self.verticalScrollBar()
         scroll_bar.setValue(scroll_bar.value() + self._autoscroll_speed)
-        cursor_pos = self.viewport().mapFromGlobal(QCursor.pos())
-        self._drag_hover_pos = cursor_pos
-        self._reorder_dragged_item(cursor_pos)
+        if self._drag_last_global_pos is not None:
+            self._update_drag(self._drag_last_global_pos)
 
     def _create_drag_placeholder(self, source_widget: QWidget) -> QWidget:
         placeholder = QFrame()
@@ -356,49 +342,55 @@ class PdfListWidget(QListWidget):
         placeholder.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         return placeholder
 
-    def _create_drag_pixmap(self, source_widget: QWidget) -> QPixmap:
-        base = source_widget.grab()
-        padding = 16
-        shadow_offset = 8
-        drag_pixmap = QPixmap(base.width() + (padding * 2), base.height() + (padding * 2) + shadow_offset)
-        drag_pixmap.fill(Qt.transparent)
+    def _update_drag(self, global_pos: QPoint) -> None:
+        if self._dragged_item is None or self._drag_overlay is None:
+            return
+        self._drag_last_global_pos = QPoint(global_pos)
+        cursor_pos = self.viewport().mapFromGlobal(global_pos)
+        self._drag_hover_pos = cursor_pos
+        self._update_autoscroll(cursor_pos)
+        self._update_drag_overlay_position(cursor_pos)
+        self._reorder_dragged_item(cursor_pos.y())
 
-        painter = QPainter(drag_pixmap)
-        painter.setRenderHint(QPainter.Antialiasing, True)
-        painter.setPen(Qt.NoPen)
-        painter.setBrush(QColor(0, 0, 0, 72))
-        painter.drawRoundedRect(padding, padding + shadow_offset, base.width(), base.height(), 18, 18)
-        painter.drawPixmap(padding, padding, base)
-        painter.end()
-        return drag_pixmap
+    def _update_drag_overlay_position(self, cursor_pos: QPoint) -> None:
+        if self._drag_overlay is None or self._dragged_item is None:
+            return
 
-    def _reorder_dragged_item(self, pos: QPoint) -> None:
+        item_rect = self.visualItemRect(self._dragged_item)
+        x = max(6, item_rect.x())
+        y = cursor_pos.y() - self._drag_hotspot.y()
+        self._drag_overlay.move(x, y)
+
+    def _reorder_dragged_item(self, center_y: int) -> None:
         if self._dragged_item is None or self._drag_placeholder is None:
             return
 
         current_row = self.row(self._dragged_item)
-        target_row = self._target_row_for_position(pos, current_row)
+        target_row = self._target_row_for_center_y(center_y, current_row)
         if target_row is None or target_row == current_row:
             return
 
         self._move_item_with_widget(current_row, target_row, self._drag_placeholder)
         self.setCurrentItem(self._dragged_item)
 
-    def _target_row_for_position(self, pos: QPoint, current_row: int) -> int | None:
-        item = self.itemAt(pos)
-        if item is None:
-            if self.count() == 0:
-                return None
-            if pos.y() < 0:
-                return 0
-            return self.count() - 1
+    def _target_row_for_center_y(self, center_y: int, current_row: int) -> int | None:
+        if self.count() == 0:
+            return None
 
-        row = self.row(item)
-        rect = self.visualItemRect(item)
-        insert_index = row if pos.y() < rect.center().y() else row + 1
-        if insert_index > current_row:
-            insert_index -= 1
-        return max(0, min(self.count() - 1, insert_index))
+        target_row = self.count() - 1
+        for row in range(self.count()):
+            if row == current_row:
+                continue
+            item = self.item(row)
+            rect = self.visualItemRect(item)
+            trigger_y = rect.top() + int(rect.height() * 0.5)
+            if center_y < trigger_y:
+                target_row = row
+                break
+
+        if target_row > current_row:
+            target_row -= 1
+        return max(0, min(self.count() - 1, target_row))
 
     def _move_item_with_widget(self, from_row: int, to_row: int, widget: QWidget | None) -> None:
         if from_row == to_row:
@@ -416,6 +408,39 @@ class PdfListWidget(QListWidget):
         if widget is not None:
             self.setItemWidget(item, widget)
             item.setSizeHint(widget.sizeHint())
+
+    def finish_card_drag(self, commit: bool) -> None:
+        app = QApplication.instance()
+        if app is not None:
+            app.removeEventFilter(self)
+
+        if self._dragged_item is None or self._dragged_widget is None:
+            self._reset_drag_state()
+            return
+
+        if not commit and self._drag_original_row is not None and self._drag_placeholder is not None:
+            self._move_item_with_widget(self.row(self._dragged_item), self._drag_original_row, self._drag_placeholder)
+
+        self.removeItemWidget(self._dragged_item)
+        self.setItemWidget(self._dragged_item, self._dragged_widget)
+        self._dragged_item.setSizeHint(self._dragged_widget.sizeHint())
+        self._dragged_widget.show()
+        self._dragged_widget.setCursor(Qt.OpenHandCursor)
+        self.setCurrentItem(self._dragged_item)
+
+        if self._drag_overlay is not None:
+            self._drag_overlay.hide()
+            self._drag_overlay.deleteLater()
+
+        self._reset_drag_state()
+        self.order_changed.emit()
+
+    def _item_for_widget(self, target_widget: QWidget) -> QListWidgetItem | None:
+        for row in range(self.count()):
+            item = self.item(row)
+            if self.itemWidget(item) is target_widget:
+                return item
+        return None
 
 
 class DropArea(QFrame):
@@ -523,12 +548,14 @@ class PdfCardWidget(QFrame):
     open_requested = Signal(str)
     preview_requested = Signal(object, object)
     preview_hidden = Signal()
+    drag_requested = Signal(object, QPoint)
 
     def __init__(self, entry: PdfEntry, thumbnail_width: int) -> None:
         super().__init__()
         self.entry = entry
         self.thumbnail_width = thumbnail_width
         self.thumbnail_image: QImage | None = None
+        self._press_pos: QPoint | None = None
         self._preview_timer = QTimer(self)
         self._preview_timer.setSingleShot(True)
         self._preview_timer.setInterval(1000)
@@ -678,6 +705,28 @@ class PdfCardWidget(QFrame):
         menu.addAction(open_action)
         menu.exec(self.mapToGlobal(pos))
 
+    def mousePressEvent(self, event) -> None:  # noqa: ANN001
+        if event.button() == Qt.LeftButton and self._can_start_drag(event.position().toPoint()):
+            self._press_pos = event.position().toPoint()
+        else:
+            self._press_pos = None
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:  # noqa: ANN001
+        if self._press_pos is not None and event.buttons() & Qt.LeftButton:
+            if (event.position().toPoint() - self._press_pos).manhattanLength() >= QApplication.startDragDistance():
+                self.preview_hidden.emit()
+                self.drag_requested.emit(self, QPoint(self._press_pos))
+                self._press_pos = None
+                event.accept()
+                return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:  # noqa: ANN001
+        self._press_pos = None
+        self.setCursor(Qt.OpenHandCursor)
+        super().mouseReleaseEvent(event)
+
     def _refresh_thumbnail(self) -> None:
         if self.thumbnail_image is None:
             self.preview_label.setPixmap(self._placeholder_pixmap())
@@ -718,6 +767,10 @@ class PdfCardWidget(QFrame):
         if self.thumbnail_image is None:
             return
         self.preview_requested.emit(self.thumbnail_image, self.preview_label)
+
+    def _can_start_drag(self, pos: QPoint) -> bool:
+        child = self.childAt(pos)
+        return not isinstance(child, QToolButton)
 
 
 class HoverPreviewOverlay(QFrame):
@@ -1181,6 +1234,7 @@ class MainWindow(QMainWindow):
         event.acceptProposedAction()
 
     def closeEvent(self, event) -> None:  # noqa: ANN001
+        self.list_widget.finish_card_drag(commit=False)
         self.settings.setValue("ui/geometry", self.saveGeometry())
         self.settings.setValue("merge/history", self.merge_overlay.serialize_records())
         self.preview_overlay.hide_preview()
@@ -1233,6 +1287,7 @@ class MainWindow(QMainWindow):
             card.open_requested.connect(self.open_original_pdf)
             card.preview_requested.connect(self.show_preview_overlay)
             card.preview_hidden.connect(self.preview_overlay.hide_preview)
+            card.drag_requested.connect(self.list_widget.start_card_drag)
 
             item = QListWidgetItem()
             item.setData(Qt.UserRole, entry.item_id)
@@ -1313,6 +1368,7 @@ class MainWindow(QMainWindow):
         self._refresh_ui_state()
 
     def clear_all(self) -> None:
+        self.list_widget.finish_card_drag(commit=False)
         self.preview_overlay.hide_preview()
         self.merge_overlay.hide_overlay()
         self.list_widget.clear()
