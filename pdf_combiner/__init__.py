@@ -1,0 +1,1 @@
+"""PDF Combiner desktop application."""
